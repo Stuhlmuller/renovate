@@ -8,5 +8,12 @@ module.exports = {
 	platformCommit: "enabled",
 	autodiscover: true,
 	onboarding: false,
-	requireConfig: "optional"
+	requireConfig: "optional",
+	labels: ["dependencies"],
+	vulnerabilityAlerts: {
+		enabled: true,
+		labels: [
+			"security"
+		]
+  }
 };
