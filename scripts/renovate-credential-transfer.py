@@ -55,6 +55,18 @@ def validate_issuer(value):
         raise RuntimeError('Expected GitHub App client ID, not a numeric App ID')
 
 
+def check_placeholders():
+    for name, _ in PARAMETERS:
+        metadata = json.loads(command([
+            'aws', 'ssm', 'describe-parameters', '--region', REGION,
+            '--parameter-filters', f'Key=Name,Option=Equals,Values={name}',
+            '--query', 'Parameters[].{Name:Name,Type:Type,KeyId:KeyId}',
+            '--output', 'json',
+        ]))
+        if metadata != [{'Name': name, 'Type': 'SecureString', 'KeyId': 'alias/aws/ssm'}]:
+            raise RuntimeError('Both declared SecureString placeholders are required')
+
+
 def store(name, value):
     with tempfile.TemporaryDirectory(prefix='renovate-ssm-') as directory:
         path = Path(directory) / 'parameter.json'
@@ -77,6 +89,7 @@ def transfer():
         validate_value(value)
     validate_issuer(values[0][1])
     validate_context()
+    check_placeholders()
     for name, value in values:
         version = store(name, value)
         print(f'{name} updated to SSM version {version}')

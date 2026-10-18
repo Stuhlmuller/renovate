@@ -2,6 +2,7 @@ import importlib.util
 import json
 from pathlib import Path
 import stat
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -42,6 +43,32 @@ class CredentialTransferTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             transfer.validate_issuer('123456')
         transfer.validate_issuer('Iv1.test')
+
+    def test_invalid_second_placeholder_prevents_both_writes(self):
+        for second_metadata in ([], [{'Type': 'String', 'KeyId': None}]):
+            with self.subTest(second_metadata=second_metadata):
+                calls = []
+
+                def fake_command(args):
+                    calls.append(args)
+                    if 'describe-parameters' in args:
+                        name = args[args.index('--parameter-filters') + 1].split('Values=')[1]
+                        if name.endswith('/issuer-id'):
+                            return json.dumps([{'Name': name, 'Type': 'SecureString',
+                                                'KeyId': 'alias/aws/ssm'}])
+                        return json.dumps([{'Name': name, **item} for item in second_metadata])
+                    raise AssertionError('No write may start before both placeholders pass')
+
+                with patch.object(transfer, 'command', fake_command), \
+                        patch.object(transfer, 'validate_context'), \
+                        patch.object(sys, 'argv', [str(SCRIPT)]), \
+                        patch.dict('os.environ', {'RENOVATE_APP_ID': 'Iv1.test',
+                                                  'RENOVATE_PRIVATE_KEY': 'private-test'}, clear=False):
+                    with self.assertRaises(RuntimeError):
+                        transfer.transfer()
+
+                self.assertEqual([args[2] for args in calls],
+                                 ['describe-parameters', 'describe-parameters'])
 
 
 if __name__ == '__main__':
