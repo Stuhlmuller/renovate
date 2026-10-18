@@ -39,6 +39,10 @@ class CredentialTransferTest(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     transfer.validate_value(value)
 
+        with self.assertRaises(RuntimeError):
+            transfer.validate_issuer('123456')
+        transfer.validate_issuer('Iv1.test')
+
 
 if __name__ == '__main__':
     unittest.main()

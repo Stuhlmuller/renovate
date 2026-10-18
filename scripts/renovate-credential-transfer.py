@@ -49,6 +49,12 @@ def validate_value(value):
         raise RuntimeError('Missing or invalid credential')
 
 
+def validate_issuer(value):
+    validate_value(value)
+    if value.isdecimal():
+        raise RuntimeError('Expected GitHub App client ID, not a numeric App ID')
+
+
 def store(name, value):
     with tempfile.TemporaryDirectory(prefix='renovate-ssm-') as directory:
         path = Path(directory) / 'parameter.json'
@@ -69,6 +75,7 @@ def transfer():
     values = [(name, os.environ.pop(variable, '')) for name, variable in PARAMETERS]
     for _, value in values:
         validate_value(value)
+    validate_issuer(values[0][1])
     validate_context()
     for name, value in values:
         version = store(name, value)
