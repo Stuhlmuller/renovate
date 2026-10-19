@@ -135,8 +135,7 @@ def legacy_runs_drained():
     for status in NONTERMINAL:
         endpoint = f'repos/{REPO}/actions/runs?status={status}&per_page=100'
         runs = pages(endpoint, 'workflow_runs')
-        if any(run.get('workflow_id') == WORKFLOW_ID and
-               run.get('event') in ('schedule', 'workflow_dispatch') for run in runs):
+        if any(run.get('workflow_id') == WORKFLOW_ID for run in runs):
             raise RuntimeError(f'Legacy Renovate {status} run remains')
 
 

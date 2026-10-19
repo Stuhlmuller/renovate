@@ -52,7 +52,7 @@ class RetirementTest(unittest.TestCase):
 
     def test_nonterminal_run_blocks_deletion_and_all_pages_are_required(self):
         with patch.object(retire, 'pages', side_effect=lambda endpoint, field: [
-                {'workflow_id': retire.WORKFLOW_ID, 'event': 'workflow_dispatch'}]
+                {'workflow_id': retire.WORKFLOW_ID, 'event': 'push'}]
                 if 'status=queued' in endpoint else []):
             with self.assertRaisesRegex(RuntimeError, 'queued run remains'):
                 retire.legacy_runs_drained()

@@ -48,9 +48,10 @@ numbers, timestamps, and the reviewed SHA. Do not enable cluster writes until
 that post-deletion receipt is recorded. The command is idempotent and never
 reads a secret value.
 
-For rollback, suspend or restore full dry-run mode in homelab GitOps and verify
-no active or pending cluster write Job before restoring the legacy workflow by
-reviewed PR. A reviewed, fixed-source secret reinjection path must restore the
+For rollback, suspend the cluster CronJob through reviewed homelab GitOps, wait
+for Argo to sync that revision, and verify all Renovate Jobs and Pods are
+terminal before restoring the legacy workflow by reviewed PR. A reviewed,
+fixed-source secret reinjection path must restore the
 Actions private-key secret before the legacy workflow can write again. Future
 credential transfer or rotation likewise needs temporary reinjection of that
 secret and the reviewed temporary AWS transfer role; retire both again after
