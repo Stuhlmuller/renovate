@@ -104,7 +104,7 @@ class RetirementTest(unittest.TestCase):
                 retire.private_key_sources()
 
     def test_placeholders_or_stale_externalsecret_block_retirement(self):
-        def metadata(version, refresh):
+        def metadata(version, refresh, key_path=retire.SSM_NAMES[1]):
             def json_command(*args):
                 if args[0] == 'aws':
                     name = args[args.index('--parameter-filters') + 1].split('Values=')[1]
@@ -112,18 +112,59 @@ class RetirementTest(unittest.TestCase):
                         'Name': name, 'Type': 'SecureString', 'KeyId': 'alias/aws/ssm',
                         'Version': version, 'LastModifiedDate': '2026-10-18T22:00:00Z',
                     }]}
-                return {'metadata': {'name': 'renovate'}, 'status': {
+                return {'metadata': {'name': 'renovate', 'namespace': 'automation'},
+                        'spec': {
+                            'target': {'name': 'renovate'},
+                            'secretStoreRef': {'kind': 'ClusterSecretStore', 'name': 'aws-ssm'},
+                            'data': [
+                                {'secretKey': 'issuer-id',
+                                 'remoteRef': {'key': retire.SSM_NAMES[0]}},
+                                {'secretKey': 'private-key',
+                                 'remoteRef': {'key': key_path}},
+                            ],
+                        }, 'status': {
                     'conditions': [{'type': 'Ready', 'status': 'True'}],
                     'refreshTime': refresh,
                 }}
             return json_command
 
-        with patch.object(retire, 'json_command', side_effect=metadata(1, '2026-10-18T23:00:00Z')):
+        def command(*args):
+            return retire.API_SERVER if args[1] == 'config' else 'renovate'
+
+        with patch.object(retire, 'command', side_effect=command), \
+                patch.object(retire, 'json_command',
+                             side_effect=metadata(1, '2026-10-18T23:00:00Z')):
             with self.assertRaisesRegex(RuntimeError, 'placeholder'):
                 retire.transferred_credentials()
-        with patch.object(retire, 'json_command', side_effect=metadata(2, '2026-10-18T21:00:00Z')):
+        with patch.object(retire, 'command', side_effect=command), \
+                patch.object(retire, 'json_command',
+                             side_effect=metadata(2, '2026-10-18T21:00:00Z')):
             with self.assertRaisesRegex(RuntimeError, 'has not refreshed'):
                 retire.transferred_credentials()
+
+        with patch.object(retire, 'command', return_value='https://wrong.example:6443'):
+            with self.assertRaisesRegex(RuntimeError, 'does not target'):
+                retire.transferred_credentials()
+        with patch.object(retire, 'command', side_effect=command), \
+                patch.object(retire, 'json_command',
+                             side_effect=metadata(2, '2026-10-18T23:00:00Z',
+                                                  '/wrong/private-key')):
+            with self.assertRaisesRegex(RuntimeError, 'no longer maps'):
+                retire.transferred_credentials()
+
+        with patch.object(retire, 'command', side_effect=lambda *args:
+                          retire.API_SERVER if args[1] == 'config' else ''), \
+                patch.object(retire, 'json_command',
+                             side_effect=metadata(2, '2026-10-18T23:00:00Z')):
+            with self.assertRaisesRegex(RuntimeError, 'target Secret is missing'):
+                retire.transferred_credentials()
+
+        with patch.object(retire, 'command', side_effect=command), \
+                patch.object(retire, 'json_command',
+                             side_effect=metadata(2, '2026-10-18T23:00:00Z')):
+            versions, refresh = retire.transferred_credentials()
+        self.assertEqual(versions[retire.SSM_NAMES[1]], 2)
+        self.assertEqual(refresh, '2026-10-18T23:00:00+00:00')
 
 
 if __name__ == '__main__':

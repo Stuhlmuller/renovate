@@ -34,9 +34,11 @@ python3 -I scripts/retire-renovate-actions-key.py check --expected-sha <reviewed
 python3 -I scripts/retire-renovate-actions-key.py retire --expected-sha <reviewed-main-sha>
 ```
 
-The fixed-target script checks current `main`, workflow absence, both SSM
-SecureString versions, a later Ready ExternalSecret refresh, every nonterminal
-legacy run state, and same-name organization/environment secrets. It deletes
+The fixed-target script checks a clean current `main`, workflow absence, the
+declared Kubernetes API server, both SSM SecureString versions, the exact
+ExternalSecret mappings and target Secret, a later Ready refresh, every
+nonterminal legacy run state, and same-name organization/environment secrets.
+It deletes
 only `RENOVATE_PRIVATE_KEY`, verifies absence, then checks runs again because a
 re-run could have queued just before deletion. A successful JSON receipt has
 `state: retired`, `actions_private_key_present: false`, and
