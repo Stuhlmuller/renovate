@@ -48,15 +48,40 @@ numbers, timestamps, and the reviewed SHA. Do not enable cluster writes until
 that post-deletion receipt is recorded. The command is idempotent and never
 reads a secret value.
 
-For rollback, suspend the cluster CronJob through reviewed homelab GitOps, wait
-for Argo to sync that revision, and verify all Renovate Jobs and Pods are
-terminal before restoring the legacy workflow by reviewed PR. Before restoring
-its Actions key, require a fresh credential-free GitHub-hosted probe of Harbor
-DNS, normal TLS, and registry endpoint reachability. A local or in-cluster
-probe does not prove the old runner's route; a 401 proves only reachability.
-If the hosted probe is unavailable or fails, keep the key absent and repair
-the cluster runner. A reviewed, fixed-source secret reinjection path must
-restore the Actions private-key secret before the legacy workflow can write again.
-Future credential transfer or rotation likewise needs temporary reinjection of that
-secret and the reviewed temporary AWS transfer role; retire both again after
-SSM and ExternalSecret verification.
+## Restore the Actions key for rollback
+
+First merge a reviewed homelab GitOps change that suspends the `automation/renovate`
+CronJob. Wait for the Renovate Argo Application to sync to that exact homelab
+`main` revision and for all Renovate Jobs and Pods to finish. Keep the legacy
+Actions workflow absent from companion `main`. From a clean checkout of its
+exact reviewed `main` commit, use an operator identity with read access to the
+declared SSM SecureString and write access to this repository's Actions secrets:
+
+```sh
+python3 -I scripts/restore-renovate-actions-key.py check \
+  --expected-sha <reviewed-companion-main-sha> \
+  --homelab-sha <reviewed-homelab-main-sha>
+python3 -I scripts/restore-renovate-actions-key.py restore \
+  --expected-sha <reviewed-companion-main-sha> \
+  --homelab-sha <reviewed-homelab-main-sha>
+```
+
+The script requires both exact current `main` revisions, the synced Argo source,
+a suspended live CronJob, no pending or active Renovate Job or Pod, the fixed
+SSM private-key SecureString at a version above its placeholder, and no
+existing same-name Actions secret. It works during an ExternalSecret outage.
+It verifies AWS account `716182248480` before SSM reads and pins the Actions
+secret target to `github.com`. It retrieves only
+`/homelab/renovate/github-app/private-key` with decryption and streams the value
+to `gh secret set` on stdin. It prints no key or command output. A successful
+JSON receipt has `state: restored`, `actions_private_key_present: true`,
+`cronjob_suspended: true`, and `renovate_nonterminal_jobs_or_pods: 0`.
+If the upload or its post-check fails, it deletes the exact repository secret
+and verifies absence. An unverified cleanup reports that historical re-runs
+may now write and requires immediate operator attention.
+
+Restore the legacy workflow only through a reviewed PR while the cluster CronJob
+stays suspended. Retire the Actions key again before cluster writes resume.
+Future credential transfer or rotation also needs the reviewed temporary AWS
+transfer role and must repeat the retirement checks after SSM and ExternalSecret
+verification.
