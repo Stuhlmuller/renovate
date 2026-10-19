@@ -11,6 +11,7 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location(
     'retire_renovate_actions_key', ROOT / 'scripts/retire-renovate-actions-key.py')
 retire = importlib.util.module_from_spec(spec)
@@ -101,6 +102,7 @@ def cluster_writer_stopped(homelab_sha):
 
 
 def private_key_version():
+    retire.aws_account()
     result = retire.json_command(
         'aws', 'ssm', 'describe-parameters', '--region', 'us-west-2',
         '--parameter-filters', f'Key=Name,Option=Equals,Values={SSM_KEY}',
@@ -117,6 +119,7 @@ def private_key_version():
 
 
 def private_key(version):
+    retire.aws_account()
     result = retire.json_command('aws', 'ssm', 'get-parameter', '--region', 'us-west-2',
                                  '--name', SSM_KEY, '--with-decryption', '--output', 'json')
     parameter = result.get('Parameter', {})
@@ -145,7 +148,7 @@ def remove_after_failed_restore():
     try:
         subprocess.run(
             ('gh', 'secret', 'delete', retire.SECRET, '--app', 'actions',
-             '--repo', retire.REPO),
+             '--repo', retire.SECRET_REPO),
             text=True, capture_output=True, cwd=ROOT, timeout=90)
     except BaseException:
         pass
@@ -172,7 +175,8 @@ def main():
             raise RuntimeError('SSM private key version changed before restore')
         try:
             result = subprocess.run(
-                ('gh', 'secret', 'set', retire.SECRET, '--app', 'actions', '--repo', retire.REPO),
+                ('gh', 'secret', 'set', retire.SECRET, '--app', 'actions',
+                 '--repo', retire.SECRET_REPO),
                 input=value, text=True, capture_output=True, cwd=ROOT, timeout=90)
             if result.returncode or not retire.private_key_sources():
                 raise RuntimeError('Actions private key restore was not confirmed')

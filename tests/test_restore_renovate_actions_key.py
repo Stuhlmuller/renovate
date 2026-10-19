@@ -3,8 +3,10 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -42,6 +44,19 @@ def cluster_json(*args):
 
 
 class RestoreTest(unittest.TestCase):
+    def test_cli_import_does_not_dirty_a_fresh_checkout_with_bytecode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scripts = Path(directory) / 'scripts'
+            scripts.mkdir()
+            shutil.copy2(SCRIPT, scripts / SCRIPT.name)
+            shutil.copy2(SCRIPT.with_name('retire-renovate-actions-key.py'),
+                         scripts / 'retire-renovate-actions-key.py')
+            result = subprocess.run(
+                (sys.executable, '-I', str(scripts / SCRIPT.name), '--help'),
+                text=True, capture_output=True, cwd=directory, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(list(Path(directory).rglob('__pycache__')))
+
     def test_cluster_requires_synced_main_suspension_and_drained_jobs_and_pods(self):
         with patch.object(restore.retire, 'command', side_effect=cluster_command), \
                 patch.object(restore.retire, 'json_command', side_effect=cluster_json):
@@ -121,18 +136,30 @@ class RestoreTest(unittest.TestCase):
     def test_private_key_is_fixed_ssm_source_and_version(self):
         metadata = {'Parameters': [{'Name': restore.SSM_KEY, 'Type': 'SecureString',
                                     'KeyId': 'alias/aws/ssm', 'Version': 2}]}
-        with patch.object(restore.retire, 'json_command', return_value=metadata):
+        with patch.object(restore.retire, 'aws_account') as account, \
+                patch.object(restore.retire, 'json_command', return_value=metadata):
             self.assertEqual(restore.private_key_version(), 2)
+        account.assert_called_once_with()
         response = {'Parameter': {'Name': restore.SSM_KEY, 'Type': 'SecureString',
                                   'Version': 2, 'Value': KEY}}
-        with patch.object(restore.retire, 'json_command', return_value=response) as command:
+        with patch.object(restore.retire, 'aws_account') as account, \
+                patch.object(restore.retire, 'json_command', return_value=response) as command:
             self.assertEqual(restore.private_key(2), KEY)
+        account.assert_called_once_with()
         self.assertEqual(command.call_args.args,
                          ('aws', 'ssm', 'get-parameter', '--region', 'us-west-2',
                           '--name', restore.SSM_KEY, '--with-decryption', '--output', 'json'))
-        with patch.object(restore.retire, 'json_command', return_value=response):
+        with patch.object(restore.retire, 'aws_account'), \
+                patch.object(restore.retire, 'json_command', return_value=response):
             with self.assertRaisesRegex(RuntimeError, 'does not match'):
                 restore.private_key(3)
+
+        with patch.object(restore.retire, 'aws_account',
+                          side_effect=RuntimeError('wrong AWS account')), \
+                patch.object(restore.retire, 'json_command') as aws:
+            with self.assertRaisesRegex(RuntimeError, 'wrong AWS account'):
+                restore.private_key(2)
+        aws.assert_not_called()
 
     def test_eso_outage_does_not_block_restore_guard_with_valid_ssm_key(self):
         with patch.object(restore.retire, 'reviewed_main'), \
@@ -166,7 +193,8 @@ class RestoreTest(unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0], ('gh', 'secret', 'set', 'RENOVATE_PRIVATE_KEY',
-                                       '--app', 'actions', '--repo', 'Stuhlmuller/renovate'))
+                                       '--app', 'actions', '--repo',
+                                       'github.com/Stuhlmuller/renovate'))
         self.assertEqual(calls[0][1]['input'], KEY)
         self.assertTrue(calls[0][1]['capture_output'])
         self.assertNotIn(KEY, output.getvalue())
@@ -196,7 +224,8 @@ class RestoreTest(unittest.TestCase):
 
         self.assertEqual(calls[0][:3], ('gh', 'secret', 'set'))
         self.assertEqual(calls[1], ('gh', 'secret', 'delete', 'RENOVATE_PRIVATE_KEY',
-                                    '--app', 'actions', '--repo', 'Stuhlmuller/renovate'))
+                                    '--app', 'actions', '--repo',
+                                    'github.com/Stuhlmuller/renovate'))
 
     def test_ambiguous_set_failure_reports_unverified_key_if_delete_cannot_prove_absence(self):
         calls = []

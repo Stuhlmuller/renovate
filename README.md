@@ -60,7 +60,8 @@ The script requires both exact current `main` revisions, the synced Argo source,
 a suspended live CronJob, no pending or active Renovate Job or Pod, the fixed
 SSM private-key SecureString at a version above its placeholder, and no
 existing same-name Actions secret. It works during an ExternalSecret outage.
-It retrieves only
+It verifies AWS account `716182248480` before SSM reads and pins the Actions
+secret target to `github.com`. It retrieves only
 `/homelab/renovate/github-app/private-key` with decryption and streams the value
 to `gh secret set` on stdin. It prints no key or command output. A successful
 JSON receipt has `state: restored`, `actions_private_key_present: true`,
