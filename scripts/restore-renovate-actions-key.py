@@ -144,7 +144,8 @@ def guard(companion_sha, homelab_sha):
 def remove_after_failed_restore():
     try:
         subprocess.run(
-            ('gh', 'secret', 'delete', retire.SECRET, '--repo', retire.REPO),
+            ('gh', 'secret', 'delete', retire.SECRET, '--app', 'actions',
+             '--repo', retire.REPO),
             text=True, capture_output=True, cwd=ROOT, timeout=90)
     except BaseException:
         pass

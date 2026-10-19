@@ -196,7 +196,7 @@ class RestoreTest(unittest.TestCase):
 
         self.assertEqual(calls[0][:3], ('gh', 'secret', 'set'))
         self.assertEqual(calls[1], ('gh', 'secret', 'delete', 'RENOVATE_PRIVATE_KEY',
-                                    '--repo', 'Stuhlmuller/renovate'))
+                                    '--app', 'actions', '--repo', 'Stuhlmuller/renovate'))
 
     def test_ambiguous_set_failure_reports_unverified_key_if_delete_cannot_prove_absence(self):
         calls = []
