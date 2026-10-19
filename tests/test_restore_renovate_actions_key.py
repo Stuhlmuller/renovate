@@ -2,7 +2,9 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
+import py_compile
 import shutil
 import subprocess
 import sys
@@ -56,6 +58,39 @@ class RestoreTest(unittest.TestCase):
                 text=True, capture_output=True, cwd=directory, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(list(Path(directory).rglob('__pycache__')))
+
+    def test_restore_uses_retirement_source_even_when_stale_pyc_is_valid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scripts = Path(directory) / 'scripts'
+            scripts.mkdir()
+            restore_path = scripts / SCRIPT.name
+            retire_path = scripts / 'retire-renovate-actions-key.py'
+            shutil.copy2(SCRIPT, restore_path)
+            shutil.copy2(SCRIPT.with_name(retire_path.name), retire_path)
+            stat = retire_path.stat()
+            py_compile.compile(str(retire_path), doraise=True,
+                               invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+            old = "AWS_ACCOUNT_ID = '716182248480'"
+            new = "AWS_ACCOUNT_ID = '999999999999'"
+            source = retire_path.read_text()
+            self.assertIn(old, source)
+            retire_path.write_text(source.replace(old, new, 1))
+            os.utime(retire_path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+            probe = ('import importlib.util, sys; '
+                     'spec = importlib.util.spec_from_file_location("probe", sys.argv[1]); '
+                     'module = importlib.util.module_from_spec(spec); '
+                     'spec.loader.exec_module(module); '
+                     'print(module.retire.AWS_ACCOUNT_ID if hasattr(module, "retire") '
+                     'else module.AWS_ACCOUNT_ID)')
+            stale = subprocess.run((sys.executable, '-I', '-c', probe, str(retire_path)),
+                                   text=True, capture_output=True, cwd=directory, timeout=30)
+            self.assertEqual(stale.returncode, 0, stale.stderr)
+            self.assertEqual(stale.stdout.strip(), '716182248480')
+            current = subprocess.run((sys.executable, '-I', '-c', probe, str(restore_path)),
+                                     text=True, capture_output=True, cwd=directory, timeout=30)
+            self.assertEqual(current.returncode, 0, current.stderr)
+            self.assertEqual(current.stdout.strip(), '999999999999')
 
     def test_cluster_requires_synced_main_suspension_and_drained_jobs_and_pods(self):
         with patch.object(restore.retire, 'command', side_effect=cluster_command), \

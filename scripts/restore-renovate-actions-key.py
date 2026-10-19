@@ -2,20 +2,19 @@
 """Restore the retired Actions writer key only after the cluster writer stops."""
 
 import argparse
-import importlib.util
 import json
 from pathlib import Path
 import re
 import subprocess
 import sys
+from types import ModuleType
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.dont_write_bytecode = True
-spec = importlib.util.spec_from_file_location(
-    'retire_renovate_actions_key', ROOT / 'scripts/retire-renovate-actions-key.py')
-retire = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(retire)
+RETIRE_PATH = ROOT / 'scripts/retire-renovate-actions-key.py'
+retire = ModuleType('retire_renovate_actions_key')
+retire.__file__ = str(RETIRE_PATH)
+exec(compile(RETIRE_PATH.read_bytes(), str(RETIRE_PATH), 'exec'), retire.__dict__)
 
 HOMELAB_REPO = 'https://github.com/Stuhlmuller/homelab.git'
 SSM_KEY = '/homelab/renovate/github-app/private-key'
