@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 REPO = 'Stuhlmuller/renovate'
 WORKFLOW_ID = 199183772
 SECRET = 'RENOVATE_PRIVATE_KEY'
+API_SERVER = 'https://10.1.0.199:6443'
 SSM_NAMES = (
     '/homelab/renovate/github-app/issuer-id',
     '/homelab/renovate/github-app/private-key',
@@ -76,6 +77,10 @@ def timestamp(value):
 
 
 def transferred_credentials():
+    server = command('kubectl', 'config', 'view', '--minify', '-o',
+                     'jsonpath={.clusters[0].cluster.server}')
+    if server != API_SERVER:
+        raise RuntimeError('Kubectl context does not target the declared homelab cluster')
     versions = {}
     modified = []
     for name in SSM_NAMES:
@@ -94,12 +99,24 @@ def transferred_credentials():
         modified.append(timestamp(parameter.get('LastModifiedDate')))
     resource = json_command('kubectl', '-n', 'automation', 'get', 'externalsecret',
                             'renovate', '-o', 'json')
+    spec = resource.get('spec', {})
+    mappings = [(item.get('secretKey'), item.get('remoteRef', {}).get('key'))
+                for item in spec.get('data', [])]
+    expected = list(zip(('issuer-id', 'private-key'), SSM_NAMES))
+    if resource.get('metadata', {}).get('namespace') != 'automation' or \
+            spec.get('target', {}).get('name') != 'renovate' or \
+            spec.get('secretStoreRef') != {'kind': 'ClusterSecretStore', 'name': 'aws-ssm'} or \
+            sorted(mappings) != sorted(expected) or spec.get('dataFrom'):
+        raise RuntimeError('Renovate ExternalSecret no longer maps the declared SSM paths')
     conditions = resource.get('status', {}).get('conditions', [])
     refresh = timestamp(resource.get('status', {}).get('refreshTime'))
     if resource.get('metadata', {}).get('name') != 'renovate' or \
             not any(item.get('type') == 'Ready' and item.get('status') == 'True'
                     for item in conditions) or refresh <= max(modified):
         raise RuntimeError('Renovate ExternalSecret has not refreshed after transfer')
+    if command('kubectl', '-n', 'automation', 'get', 'secret', 'renovate', '-o',
+               'jsonpath={.metadata.name}') != 'renovate':
+        raise RuntimeError('Renovate target Secret is missing')
     return versions, refresh.isoformat()
 
 
