@@ -43,7 +43,7 @@ class RetirementTest(unittest.TestCase):
                 contextlib.redirect_stdout(output):
             retire.main()
 
-        self.assertEqual(order, ['main', 'drain', 'sources', 'delete', 'sources', 'drain'])
+        self.assertEqual(order, ['main', 'drain', 'sources', 'main', 'delete', 'sources', 'drain'])
         receipt = json.loads(output.getvalue())
         self.assertEqual(receipt['state'], 'retired')
         self.assertEqual(receipt['actions_private_key_present'], False)
@@ -60,6 +60,21 @@ class RetirementTest(unittest.TestCase):
                 {'total_count': 2, 'workflow_runs': [{'id': 1}]}]):
             with self.assertRaisesRegex(RuntimeError, 'pagination was incomplete'):
                 retire.pages('unused', 'workflow_runs')
+
+    def test_dirty_checkout_blocks_retirement(self):
+        outputs = {
+            ('git', 'symbolic-ref', '--short', 'HEAD'): 'main',
+            ('git', 'rev-parse', 'HEAD'): SHA,
+            ('git', 'ls-remote', 'https://github.com/Stuhlmuller/renovate.git',
+             'refs/heads/main'): f'{SHA}\trefs/heads/main',
+            ('git', 'ls-tree', '-r', '--name-only', 'HEAD', '--',
+             '.github/workflows/renovate.yml'): '',
+            ('git', 'status', '--porcelain', '--untracked-files=all'):
+            ' M scripts/retire-renovate-actions-key.py',
+        }
+        with patch.object(retire, 'command', side_effect=lambda *args: outputs[args]):
+            with self.assertRaisesRegex(RuntimeError, 'Local checkout differs'):
+                retire.reviewed_main(SHA)
 
     def test_same_name_organization_or_environment_secret_blocks_retirement(self):
         def pages(endpoint, field):

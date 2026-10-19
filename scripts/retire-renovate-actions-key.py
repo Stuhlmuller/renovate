@@ -62,6 +62,8 @@ def reviewed_main(expected_sha):
     if command('git', 'ls-tree', '-r', '--name-only', 'HEAD', '--',
                '.github/workflows/renovate.yml'):
         raise RuntimeError('Legacy writer workflow remains in reviewed main')
+    if command('git', 'status', '--porcelain', '--untracked-files=all'):
+        raise RuntimeError('Local checkout differs from reviewed main')
 
 
 def timestamp(value):
@@ -138,6 +140,7 @@ def main():
     legacy_runs_drained()
     present = private_key_sources()
     if args.mode == 'retire':
+        reviewed_main(args.expected_sha)
         if present:
             command('gh', 'secret', 'delete', SECRET, '--repo', REPO)
         if private_key_sources():
