@@ -29,7 +29,8 @@ class RetirementTest(unittest.TestCase):
 
         def command(*args):
             self.assertEqual(args, ('gh', 'secret', 'delete', 'RENOVATE_PRIVATE_KEY',
-                                    '--repo', 'Stuhlmuller/renovate'))
+                                    '--app', 'actions', '--repo',
+                                    'github.com/Stuhlmuller/renovate'))
             order.append('delete')
             return ''
 
@@ -57,9 +58,11 @@ class RetirementTest(unittest.TestCase):
                 retire.legacy_runs_drained()
 
         with patch.object(retire, 'json_command', return_value=[
-                {'total_count': 2, 'workflow_runs': [{'id': 1}]}]):
+                {'total_count': 2, 'workflow_runs': [{'id': 1}]}]) as api:
             with self.assertRaisesRegex(RuntimeError, 'pagination was incomplete'):
                 retire.pages('unused', 'workflow_runs')
+        api.assert_called_once_with('gh', 'api', '--hostname', 'github.com',
+                                    '--paginate', '--slurp', 'unused')
 
     def test_dirty_checkout_blocks_retirement(self):
         outputs = {
@@ -106,6 +109,8 @@ class RetirementTest(unittest.TestCase):
     def test_placeholders_or_stale_externalsecret_block_retirement(self):
         def metadata(version, refresh, key_path=retire.SSM_NAMES[1]):
             def json_command(*args):
+                if args[:2] == ('aws', 'sts'):
+                    return {'Account': retire.AWS_ACCOUNT_ID}
                 if args[0] == 'aws':
                     name = args[args.index('--parameter-filters') + 1].split('Values=')[1]
                     return {'Parameters': [{
@@ -165,6 +170,15 @@ class RetirementTest(unittest.TestCase):
             versions, refresh = retire.transferred_credentials()
         self.assertEqual(versions[retire.SSM_NAMES[1]], 2)
         self.assertEqual(refresh, '2026-10-18T23:00:00+00:00')
+
+    def test_wrong_aws_account_blocks_ssm_metadata_read(self):
+        with patch.object(retire, 'command', return_value=retire.API_SERVER), \
+                patch.object(retire, 'json_command',
+                             return_value={'Account': '000000000000'}) as aws:
+            with self.assertRaisesRegex(RuntimeError, 'declared homelab account'):
+                retire.transferred_credentials()
+        aws.assert_called_once_with('aws', 'sts', 'get-caller-identity',
+                                    '--region', 'us-west-2', '--output', 'json')
 
 
 if __name__ == '__main__':
