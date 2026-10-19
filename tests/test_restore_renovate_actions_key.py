@@ -18,13 +18,21 @@ HOMELAB_SHA = 'b' * 40
 KEY = '-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----\n'
 
 
+def cluster_command(*args):
+    if args[0] == 'kubectl':
+        return restore.retire.API_SERVER
+    return f'{HOMELAB_SHA}\trefs/heads/main'
+
+
 def cluster_json(*args):
     if 'application' in args:
         return {'metadata': {'name': 'renovate', 'namespace': 'argocd'},
                 'spec': {'sources': [{'repoURL': restore.HOMELAB_REPO,
                                       'targetRevision': 'main',
                                       'path': 'clusters/homelab/apps/renovate'}]},
-                'status': {'sync': {'status': 'Synced', 'revisions': [HOMELAB_SHA]}}}
+                'status': {'sync': {'status': 'Synced', 'revisions': [HOMELAB_SHA]},
+                           'resources': [{'kind': 'CronJob', 'name': 'renovate',
+                                          'namespace': 'automation', 'status': 'Synced'}]}}
     if 'cronjob' in args:
         return {'metadata': {'name': 'renovate', 'namespace': 'automation'},
                 'spec': {'suspend': True}}
@@ -35,8 +43,7 @@ def cluster_json(*args):
 
 class RestoreTest(unittest.TestCase):
     def test_cluster_requires_synced_main_suspension_and_drained_jobs_and_pods(self):
-        remote = f'{HOMELAB_SHA}\trefs/heads/main'
-        with patch.object(restore.retire, 'command', return_value=remote), \
+        with patch.object(restore.retire, 'command', side_effect=cluster_command), \
                 patch.object(restore.retire, 'json_command', side_effect=cluster_json):
             restore.cluster_writer_stopped(HOMELAB_SHA)
 
@@ -46,8 +53,19 @@ class RestoreTest(unittest.TestCase):
                 result['status']['sync']['revisions'] = [SHA]
             return result
 
-        with patch.object(restore.retire, 'command', return_value=remote), \
+        with patch.object(restore.retire, 'command', side_effect=cluster_command), \
                 patch.object(restore.retire, 'json_command', side_effect=stale_app):
+            with self.assertRaisesRegex(RuntimeError, 'not synced'):
+                restore.cluster_writer_stopped(HOMELAB_SHA)
+
+        def ignored_cron(*args):
+            result = cluster_json(*args)
+            if 'application' in args:
+                result['spec']['ignoreDifferences'] = [{'kind': 'CronJob'}]
+            return result
+
+        with patch.object(restore.retire, 'command', side_effect=cluster_command), \
+                patch.object(restore.retire, 'json_command', side_effect=ignored_cron):
             with self.assertRaisesRegex(RuntimeError, 'not synced'):
                 restore.cluster_writer_stopped(HOMELAB_SHA)
 
@@ -57,7 +75,7 @@ class RestoreTest(unittest.TestCase):
                 result['spec']['suspend'] = False
             return result
 
-        with patch.object(restore.retire, 'command', return_value=remote), \
+        with patch.object(restore.retire, 'command', side_effect=cluster_command), \
                 patch.object(restore.retire, 'json_command', side_effect=unsafe):
             with self.assertRaisesRegex(RuntimeError, 'not suspended'):
                 restore.cluster_writer_stopped(HOMELAB_SHA)
@@ -69,7 +87,7 @@ class RestoreTest(unittest.TestCase):
                                        {'name': 'renovate'}]}}}, 'status': {}}]}
             return cluster_json(*args)
 
-        with patch.object(restore.retire, 'command', return_value=remote), \
+        with patch.object(restore.retire, 'command', side_effect=cluster_command), \
                 patch.object(restore.retire, 'json_command', side_effect=pending_job):
             with self.assertRaisesRegex(RuntimeError, 'Job is active or pending'):
                 restore.cluster_writer_stopped(HOMELAB_SHA)
@@ -82,13 +100,18 @@ class RestoreTest(unittest.TestCase):
                                    'status': {'phase': 'Pending'}}]}
             return cluster_json(*args)
 
-        with patch.object(restore.retire, 'command', return_value=remote), \
+        with patch.object(restore.retire, 'command', side_effect=cluster_command), \
                 patch.object(restore.retire, 'json_command', side_effect=pending_pod):
             with self.assertRaisesRegex(RuntimeError, 'Pod is active or pending'):
                 restore.cluster_writer_stopped(HOMELAB_SHA)
 
     def test_remote_revision_and_incomplete_inventory_fail_closed(self):
-        with patch.object(restore.retire, 'command', return_value=f'{SHA}\trefs/heads/main'):
+        def stale_main(*args):
+            if args[0] == 'kubectl':
+                return restore.retire.API_SERVER
+            return f'{SHA}\trefs/heads/main'
+
+        with patch.object(restore.retire, 'command', side_effect=stale_main):
             with self.assertRaisesRegex(RuntimeError, 'Homelab main moved'):
                 restore.cluster_writer_stopped(HOMELAB_SHA)
         with patch.object(restore.retire, 'json_command', return_value={'items': 'partial'}):
@@ -96,6 +119,10 @@ class RestoreTest(unittest.TestCase):
                 restore.items('jobs')
 
     def test_private_key_is_fixed_ssm_source_and_version(self):
+        metadata = {'Parameters': [{'Name': restore.SSM_KEY, 'Type': 'SecureString',
+                                    'KeyId': 'alias/aws/ssm', 'Version': 2}]}
+        with patch.object(restore.retire, 'json_command', return_value=metadata):
+            self.assertEqual(restore.private_key_version(), 2)
         response = {'Parameter': {'Name': restore.SSM_KEY, 'Type': 'SecureString',
                                   'Version': 2, 'Value': KEY}}
         with patch.object(restore.retire, 'json_command', return_value=response) as command:
@@ -106,6 +133,17 @@ class RestoreTest(unittest.TestCase):
         with patch.object(restore.retire, 'json_command', return_value=response):
             with self.assertRaisesRegex(RuntimeError, 'does not match'):
                 restore.private_key(3)
+
+    def test_eso_outage_does_not_block_restore_guard_with_valid_ssm_key(self):
+        with patch.object(restore.retire, 'reviewed_main'), \
+                patch.object(restore, 'private_key_version', return_value=2), \
+                patch.object(restore.retire, 'legacy_runs_drained'), \
+                patch.object(restore, 'cluster_writer_stopped'), \
+                patch.object(restore.retire, 'private_key_sources', return_value=False), \
+                patch.object(restore.retire, 'transferred_credentials',
+                             side_effect=RuntimeError('ESO unavailable')) as eso:
+            self.assertEqual(restore.guard(SHA, HOMELAB_SHA), 2)
+        eso.assert_not_called()
 
     def test_restore_streams_key_to_only_actions_secret_and_receipt_omits_it(self):
         output = io.StringIO()
@@ -120,6 +158,7 @@ class RestoreTest(unittest.TestCase):
                 patch.object(restore, 'guard', side_effect=[2, 2]), \
                 patch.object(restore, 'private_key', return_value=KEY), \
                 patch.object(restore.retire, 'private_key_sources', return_value=True), \
+                patch.object(restore.retire, 'reviewed_main'), \
                 patch.object(restore, 'cluster_writer_stopped'), \
                 patch.object(restore.subprocess, 'run', side_effect=run), \
                 contextlib.redirect_stdout(output):
@@ -134,6 +173,69 @@ class RestoreTest(unittest.TestCase):
         receipt = json.loads(output.getvalue())
         self.assertEqual((receipt['state'], receipt['actions_private_key_present']),
                          ('restored', True))
+
+    def test_post_write_failure_deletes_key_and_verifies_absence(self):
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 0, '', '')
+
+        with patch.object(sys, 'argv', [str(SCRIPT), 'restore', '--expected-sha', SHA,
+                                        '--homelab-sha', HOMELAB_SHA]), \
+                patch.object(restore, 'guard', side_effect=[2, 2]), \
+                patch.object(restore, 'private_key', return_value=KEY), \
+                patch.object(restore.retire, 'private_key_sources',
+                             side_effect=[True, False]), \
+                patch.object(restore.retire, 'reviewed_main'), \
+                patch.object(restore, 'cluster_writer_stopped',
+                             side_effect=RuntimeError('main moved')), \
+                patch.object(restore.subprocess, 'run', side_effect=run):
+            with self.assertRaisesRegex(RuntimeError, 'repository secret removed'):
+                restore.main()
+
+        self.assertEqual(calls[0][:3], ('gh', 'secret', 'set'))
+        self.assertEqual(calls[1], ('gh', 'secret', 'delete', 'RENOVATE_PRIVATE_KEY',
+                                    '--repo', 'Stuhlmuller/renovate'))
+
+    def test_ambiguous_set_failure_reports_unverified_key_if_delete_cannot_prove_absence(self):
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 1, KEY, KEY)
+
+        with patch.object(sys, 'argv', [str(SCRIPT), 'restore', '--expected-sha', SHA,
+                                        '--homelab-sha', HOMELAB_SHA]), \
+                patch.object(restore, 'guard', side_effect=[2, 2]), \
+                patch.object(restore, 'private_key', return_value=KEY), \
+                patch.object(restore.retire, 'private_key_sources', return_value=True), \
+                patch.object(restore.subprocess, 'run', side_effect=run):
+            with self.assertRaisesRegex(RuntimeError, 'historical re-runs may now write') as err:
+                restore.main()
+
+        self.assertNotIn(KEY, str(err.exception))
+        self.assertEqual([call[2] for call in calls], ['set', 'delete'])
+
+    def test_set_timeout_still_deletes_and_verifies_absence(self):
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append(args)
+            if args[2] == 'set':
+                raise subprocess.TimeoutExpired(args, 90)
+            return subprocess.CompletedProcess(args, 0, '', '')
+
+        with patch.object(sys, 'argv', [str(SCRIPT), 'restore', '--expected-sha', SHA,
+                                        '--homelab-sha', HOMELAB_SHA]), \
+                patch.object(restore, 'guard', side_effect=[2, 2]), \
+                patch.object(restore, 'private_key', return_value=KEY), \
+                patch.object(restore.retire, 'private_key_sources', return_value=False), \
+                patch.object(restore.subprocess, 'run', side_effect=run):
+            with self.assertRaisesRegex(RuntimeError, 'repository secret removed'):
+                restore.main()
+
+        self.assertEqual([call[2] for call in calls], ['set', 'delete'])
 
 
 if __name__ == '__main__':

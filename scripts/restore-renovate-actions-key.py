@@ -50,6 +50,10 @@ def is_renovate(resource):
 def cluster_writer_stopped(homelab_sha):
     if not re.fullmatch(r'[0-9a-f]{40}', homelab_sha):
         raise RuntimeError('Expected exact reviewed homelab main SHA')
+    server = retire.command('kubectl', 'config', 'view', '--minify', '-o',
+                            'jsonpath={.clusters[0].cluster.server}')
+    if server != retire.API_SERVER:
+        raise RuntimeError('Kubectl context does not target the declared homelab cluster')
     remote = retire.command('git', 'ls-remote', HOMELAB_REPO, 'refs/heads/main').split()
     if remote != [homelab_sha, 'refs/heads/main']:
         raise RuntimeError('Homelab main moved; review the new commit')
@@ -57,12 +61,17 @@ def cluster_writer_stopped(homelab_sha):
     app = retire.json_command('kubectl', '-n', 'argocd', 'get', 'application',
                               'renovate', '-o', 'json')
     sources = app.get('spec', {}).get('sources')
+    resources = app.get('status', {}).get('resources', [])
     sync = app.get('status', {}).get('sync', {})
     if app.get('metadata', {}).get('name') != 'renovate' or \
             app.get('metadata', {}).get('namespace') != 'argocd' or \
             sources != [{'repoURL': HOMELAB_REPO, 'targetRevision': 'main',
                          'path': 'clusters/homelab/apps/renovate'}] or \
-            sync.get('status') != 'Synced' or sync.get('revisions') != [homelab_sha]:
+            app.get('spec', {}).get('ignoreDifferences') or \
+            sync.get('status') != 'Synced' or sync.get('revisions') != [homelab_sha] or \
+            not any(item.get('kind') == 'CronJob' and item.get('name') == 'renovate' and
+                    item.get('namespace') == 'automation' and item.get('status') == 'Synced'
+                    for item in resources):
         raise RuntimeError('Renovate Argo Application is not synced to reviewed homelab main')
 
     cron = retire.json_command('kubectl', '-n', 'automation', 'get', 'cronjob',
@@ -91,6 +100,22 @@ def cluster_writer_stopped(homelab_sha):
             raise RuntimeError('Renovate Pod is active or pending')
 
 
+def private_key_version():
+    result = retire.json_command(
+        'aws', 'ssm', 'describe-parameters', '--region', 'us-west-2',
+        '--parameter-filters', f'Key=Name,Option=Equals,Values={SSM_KEY}',
+        '--output', 'json')
+    parameters = result.get('Parameters')
+    if not isinstance(parameters, list) or len(parameters) != 1:
+        raise RuntimeError('Declared SSM private key is missing')
+    parameter = parameters[0]
+    if parameter.get('Name') != SSM_KEY or parameter.get('Type') != 'SecureString' or \
+            parameter.get('KeyId') != 'alias/aws/ssm' or \
+            type(parameter.get('Version')) is not int or parameter['Version'] < 2:
+        raise RuntimeError('Declared SSM private key has not replaced its placeholder')
+    return parameter['Version']
+
+
 def private_key(version):
     result = retire.json_command('aws', 'ssm', 'get-parameter', '--region', 'us-west-2',
                                  '--name', SSM_KEY, '--with-decryption', '--output', 'json')
@@ -108,12 +133,28 @@ def private_key(version):
 
 def guard(companion_sha, homelab_sha):
     retire.reviewed_main(companion_sha)
-    versions, _ = retire.transferred_credentials()
+    version = private_key_version()
     retire.legacy_runs_drained()
     cluster_writer_stopped(homelab_sha)
     if retire.private_key_sources():
         raise RuntimeError('Repository Actions private key already exists')
-    return versions[SSM_KEY]
+    return version
+
+
+def remove_after_failed_restore():
+    try:
+        subprocess.run(
+            ('gh', 'secret', 'delete', retire.SECRET, '--repo', retire.REPO),
+            text=True, capture_output=True, cwd=ROOT, timeout=90)
+    except BaseException:
+        pass
+    try:
+        if not retire.private_key_sources():
+            return
+    except BaseException:
+        pass
+    raise RuntimeError(
+        'Actions key absence cannot be verified; historical re-runs may now write')
 
 
 def main():
@@ -128,14 +169,18 @@ def main():
         value = private_key(version)
         if guard(args.expected_sha, args.homelab_sha) != version:
             raise RuntimeError('SSM private key version changed before restore')
-        result = subprocess.run(
-            ('gh', 'secret', 'set', retire.SECRET, '--app', 'actions', '--repo', retire.REPO),
-            input=value, text=True, capture_output=True, cwd=ROOT, timeout=90)
-        if result.returncode:
-            raise RuntimeError('Actions private key restore failed; command output withheld')
-        if not retire.private_key_sources():
-            raise RuntimeError('Restored Actions private key is not visible')
-        cluster_writer_stopped(args.homelab_sha)
+        try:
+            result = subprocess.run(
+                ('gh', 'secret', 'set', retire.SECRET, '--app', 'actions', '--repo', retire.REPO),
+                input=value, text=True, capture_output=True, cwd=ROOT, timeout=90)
+            if result.returncode or not retire.private_key_sources():
+                raise RuntimeError('Actions private key restore was not confirmed')
+            retire.reviewed_main(args.expected_sha)
+            cluster_writer_stopped(args.homelab_sha)
+        except BaseException:
+            remove_after_failed_restore()
+            raise RuntimeError('Actions key restore was not confirmed; repository secret removed') \
+                from None
     print(json.dumps({
         'state': 'ready' if args.mode == 'check' else 'restored',
         'companion_main_sha': args.expected_sha,

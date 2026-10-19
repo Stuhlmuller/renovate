@@ -57,13 +57,17 @@ python3 -I scripts/restore-renovate-actions-key.py restore \
 ```
 
 The script requires both exact current `main` revisions, the synced Argo source,
-a suspended live CronJob, no pending or active Renovate Job or Pod, the same
-transferred SSM and ExternalSecret metadata checks used for retirement, and no
-existing same-name Actions secret. It retrieves only
+a suspended live CronJob, no pending or active Renovate Job or Pod, the fixed
+SSM private-key SecureString at a version above its placeholder, and no
+existing same-name Actions secret. It works during an ExternalSecret outage.
+It retrieves only
 `/homelab/renovate/github-app/private-key` with decryption and streams the value
 to `gh secret set` on stdin. It prints no key or command output. A successful
 JSON receipt has `state: restored`, `actions_private_key_present: true`,
 `cronjob_suspended: true`, and `renovate_nonterminal_jobs_or_pods: 0`.
+If the upload or its post-check fails, it deletes the exact repository secret
+and verifies absence. An unverified cleanup reports that historical re-runs
+may now write and requires immediate operator attention.
 
 Restore the legacy workflow only through a reviewed PR while the cluster CronJob
 stays suspended. Retire the Actions key again before cluster writes resume.
