@@ -1,0 +1,20 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^scripts\\/fixtures\\/renovate-cache-canary\\.txt$/"],
+      "matchStrings": ["RENOVATE_CACHE_CANARY=(?<currentValue>v0\\.0\\.\\d+)"],
+      "depNameTemplate": "Stuhlmuller/renovate",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver"
+    }
+  ],
+  "packageRules": [
+    {
+      "matchManagers": ["custom.regex"],
+      "matchPackageNames": ["Stuhlmuller/renovate"],
+      "automerge": false
+    }
+  ]
+}
