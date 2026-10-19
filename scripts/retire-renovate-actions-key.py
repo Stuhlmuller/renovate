@@ -13,8 +13,10 @@ from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO = 'Stuhlmuller/renovate'
+SECRET_REPO = 'github.com/Stuhlmuller/renovate'
 WORKFLOW_ID = 199183772
 SECRET = 'RENOVATE_PRIVATE_KEY'
+AWS_ACCOUNT_ID = '716182248480'
 API_SERVER = 'https://10.1.0.199:6443'
 SSM_NAMES = (
     '/homelab/renovate/github-app/issuer-id',
@@ -35,7 +37,8 @@ def json_command(*args):
 
 
 def pages(endpoint, field):
-    data = json_command('gh', 'api', '--paginate', '--slurp', endpoint)
+    data = json_command('gh', 'api', '--hostname', 'github.com',
+                        '--paginate', '--slurp', endpoint)
     if not isinstance(data, list) or not data or not isinstance(data[0], dict) or \
             not isinstance(data[0].get('total_count'), int):
         raise RuntimeError('GitHub returned invalid pagination')
@@ -76,11 +79,19 @@ def timestamp(value):
     return parsed.astimezone(timezone.utc)
 
 
+def aws_account():
+    identity = json_command('aws', 'sts', 'get-caller-identity', '--region', 'us-west-2',
+                            '--output', 'json')
+    if identity.get('Account') != AWS_ACCOUNT_ID:
+        raise RuntimeError('AWS credentials do not target the declared homelab account')
+
+
 def transferred_credentials():
     server = command('kubectl', 'config', 'view', '--minify', '-o',
                      'jsonpath={.clusters[0].cluster.server}')
     if server != API_SERVER:
         raise RuntimeError('Kubectl context does not target the declared homelab cluster')
+    aws_account()
     versions = {}
     modified = []
     for name in SSM_NAMES:
@@ -159,7 +170,8 @@ def main():
     if args.mode == 'retire':
         reviewed_main(args.expected_sha)
         if present:
-            command('gh', 'secret', 'delete', SECRET, '--repo', REPO)
+            command('gh', 'secret', 'delete', SECRET, '--app', 'actions',
+                    '--repo', SECRET_REPO)
         if private_key_sources():
             raise RuntimeError('Legacy Actions private key still exists')
         # A re-run queued immediately before deletion could retain the old secret.
