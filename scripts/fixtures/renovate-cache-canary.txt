@@ -1,2 +1,2 @@
 # Temporary github-releases cache canary; remove after homelab SC-003 evidence.
-RENOVATE_CACHE_CANARY=v0.0.1
+RENOVATE_CACHE_CANARY=v0.0.2
