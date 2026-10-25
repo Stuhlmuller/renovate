@@ -9,10 +9,34 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: renovate-writer
+  cancel-in-progress: false
+
 jobs:
   renovate:
     runs-on: ubuntu-latest
     steps:
+      - name: Probe anonymous Harbor Docker route
+        shell: bash
+        run: |
+          set -euo pipefail
+          probe_config="$(mktemp -d \
+            "${RUNNER_TEMP}/renovate-harbor-probe.XXXXXX")"
+          trap 'rm -rf "$probe_config"' EXIT
+          image="harbor.stinkyboi.com/mirror/docker.io/library/postgres"
+          image+="@sha256:afc7e2d441324c0388fa80c3d24f733b"
+          image+="4194a4eb7f47dd8ee2b08eb1a24a647c"
+          if timeout --signal=TERM --kill-after=5s 45s \
+            docker --config "$probe_config" manifest inspect "$image" \
+            >/dev/null 2>&1; then
+            echo "Harbor Docker route probe passed."
+          else
+            status=$?
+            echo "::error::Harbor probe exit ${status}; no App token."
+            exit "$status"
+          fi
+
       - name: Get token
         id: get_token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
