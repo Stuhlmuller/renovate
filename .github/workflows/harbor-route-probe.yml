@@ -1,0 +1,52 @@
+---
+name: Harbor route probe
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  harbor-route:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check direct Harbor registry route
+        shell: bash
+        run: |
+          set -euo pipefail
+          host=harbor.stinkyboi.com
+          if ! getent ahostsv4 "$host" >/dev/null; then
+            echo 'harbor_dns=failed'
+            exit 1
+          fi
+          echo 'harbor_dns=ok'
+
+          probe() {
+            local label="$1" url="$2" response status headers
+            if ! response="$(curl --silent --noproxy '*' --connect-timeout 5 \
+              --max-time 15 --proto '=https' --dump-header - --output /dev/null \
+              --write-out $'\nHTTP_CODE:%{http_code}' \
+              --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json' \
+              "$url")"; then
+              echo "${label}_https=failed"
+              return 1
+            fi
+            status="${response##*HTTP_CODE:}"
+            headers="${response%$'\n'HTTP_CODE:*}"
+            case "$status" in
+              200|401) ;;
+              *) echo "${label}_http=unexpected"; return 1 ;;
+            esac
+            if [[ "$label" == registry ]] && ! grep -Eiq \
+              '^(docker-distribution-api-version:[[:space:]]*registry/2\.0|www-authenticate:[[:space:]]*bearer[[:space:]])' \
+              <<< "$headers"; then
+              echo 'registry_v2=unverified'
+              return 1
+            fi
+            echo "${label}_http=${status}"
+          }
+
+          probe registry "https://${host}/v2/"
+          probe manifest "https://${host}/v2/mirror/ghcr.io/renovatebot/renovate/manifests/44.167.4"
+          echo 'harbor_route=pass; private_package_auth=unverified'

@@ -1,0 +1,306 @@
+import contextlib
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import py_compile
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+
+SCRIPT = Path(__file__).resolve().parents[1] / 'scripts/restore-renovate-actions-key.py'
+spec = importlib.util.spec_from_file_location('restore_actions_key', SCRIPT)
+restore = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(restore)
+SHA = 'a' * 40
+HOMELAB_SHA = 'b' * 40
+KEY = '-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----\n'
+
+
+def cluster_command(*args):
+    if args[0] == 'kubectl':
+        return restore.retire.API_SERVER
+    return f'{HOMELAB_SHA}\trefs/heads/main'
+
+
+def cluster_json(*args):
+    if 'application' in args:
+        return {'metadata': {'name': 'renovate', 'namespace': 'argocd'},
+                'spec': {'sources': [{'repoURL': restore.HOMELAB_REPO,
+                                      'targetRevision': 'main',
+                                      'path': 'clusters/homelab/apps/renovate'}]},
+                'status': {'sync': {'status': 'Synced', 'revisions': [HOMELAB_SHA]},
+                           'resources': [{'kind': 'CronJob', 'name': 'renovate',
+                                          'namespace': 'automation', 'status': 'Synced'}]}}
+    if 'cronjob' in args:
+        return {'metadata': {'name': 'renovate', 'namespace': 'automation'},
+                'spec': {'suspend': True}}
+    if 'jobs' in args or 'pods' in args:
+        return {'items': []}
+    raise AssertionError(args)
+
+
+class RestoreTest(unittest.TestCase):
+    def test_cli_import_does_not_dirty_a_fresh_checkout_with_bytecode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scripts = Path(directory) / 'scripts'
+            scripts.mkdir()
+            shutil.copy2(SCRIPT, scripts / SCRIPT.name)
+            shutil.copy2(SCRIPT.with_name('retire-renovate-actions-key.py'),
+                         scripts / 'retire-renovate-actions-key.py')
+            result = subprocess.run(
+                (sys.executable, '-I', str(scripts / SCRIPT.name), '--help'),
+                text=True, capture_output=True, cwd=directory, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(list(Path(directory).rglob('__pycache__')))
+
+    def test_restore_uses_retirement_source_even_when_stale_pyc_is_valid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scripts = Path(directory) / 'scripts'
+            scripts.mkdir()
+            restore_path = scripts / SCRIPT.name
+            retire_path = scripts / 'retire-renovate-actions-key.py'
+            shutil.copy2(SCRIPT, restore_path)
+            shutil.copy2(SCRIPT.with_name(retire_path.name), retire_path)
+            stat = retire_path.stat()
+            py_compile.compile(str(retire_path), doraise=True,
+                               invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+            old = "AWS_ACCOUNT_ID = '716182248480'"
+            new = "AWS_ACCOUNT_ID = '999999999999'"
+            source = retire_path.read_text()
+            self.assertIn(old, source)
+            retire_path.write_text(source.replace(old, new, 1))
+            os.utime(retire_path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+            probe = ('import importlib.util, sys; '
+                     'spec = importlib.util.spec_from_file_location("probe", sys.argv[1]); '
+                     'module = importlib.util.module_from_spec(spec); '
+                     'spec.loader.exec_module(module); '
+                     'print(module.retire.AWS_ACCOUNT_ID if hasattr(module, "retire") '
+                     'else module.AWS_ACCOUNT_ID)')
+            stale = subprocess.run((sys.executable, '-I', '-c', probe, str(retire_path)),
+                                   text=True, capture_output=True, cwd=directory, timeout=30)
+            self.assertEqual(stale.returncode, 0, stale.stderr)
+            self.assertEqual(stale.stdout.strip(), '716182248480')
+            current = subprocess.run((sys.executable, '-I', '-c', probe, str(restore_path)),
+                                     text=True, capture_output=True, cwd=directory, timeout=30)
+            self.assertEqual(current.returncode, 0, current.stderr)
+            self.assertEqual(current.stdout.strip(), '999999999999')
+
+    def test_cluster_requires_synced_main_suspension_and_drained_jobs_and_pods(self):
+        with patch.object(restore.retire, 'command', side_effect=cluster_command), \
+                patch.object(restore.retire, 'json_command', side_effect=cluster_json):
+            restore.cluster_writer_stopped(HOMELAB_SHA)
+
+        def stale_app(*args):
+            result = cluster_json(*args)
+            if 'application' in args:
+                result['status']['sync']['revisions'] = [SHA]
+            return result
+
+        with patch.object(restore.retire, 'command', side_effect=cluster_command), \
+                patch.object(restore.retire, 'json_command', side_effect=stale_app):
+            with self.assertRaisesRegex(RuntimeError, 'not synced'):
+                restore.cluster_writer_stopped(HOMELAB_SHA)
+
+        def ignored_cron(*args):
+            result = cluster_json(*args)
+            if 'application' in args:
+                result['spec']['ignoreDifferences'] = [{'kind': 'CronJob'}]
+            return result
+
+        with patch.object(restore.retire, 'command', side_effect=cluster_command), \
+                patch.object(restore.retire, 'json_command', side_effect=ignored_cron):
+            with self.assertRaisesRegex(RuntimeError, 'not synced'):
+                restore.cluster_writer_stopped(HOMELAB_SHA)
+
+        def unsafe(*args):
+            result = cluster_json(*args)
+            if 'cronjob' in args:
+                result['spec']['suspend'] = False
+            return result
+
+        with patch.object(restore.retire, 'command', side_effect=cluster_command), \
+                patch.object(restore.retire, 'json_command', side_effect=unsafe):
+            with self.assertRaisesRegex(RuntimeError, 'not suspended'):
+                restore.cluster_writer_stopped(HOMELAB_SHA)
+
+        def pending_job(*args):
+            if 'jobs' in args:
+                return {'items': [{'kind': 'Job', 'metadata': {'name': 'manual-renovate'},
+                                   'spec': {'template': {'spec': {'containers': [
+                                       {'name': 'renovate'}]}}}, 'status': {}}]}
+            return cluster_json(*args)
+
+        with patch.object(restore.retire, 'command', side_effect=cluster_command), \
+                patch.object(restore.retire, 'json_command', side_effect=pending_job):
+            with self.assertRaisesRegex(RuntimeError, 'Job is active or pending'):
+                restore.cluster_writer_stopped(HOMELAB_SHA)
+
+        def pending_pod(*args):
+            if 'pods' in args:
+                return {'items': [{'kind': 'Pod', 'metadata': {'name': 'renovate-orphan',
+                                   'labels': {'app.kubernetes.io/name': 'renovate'}},
+                                   'spec': {'containers': [{'name': 'renovate'}]},
+                                   'status': {'phase': 'Pending'}}]}
+            return cluster_json(*args)
+
+        with patch.object(restore.retire, 'command', side_effect=cluster_command), \
+                patch.object(restore.retire, 'json_command', side_effect=pending_pod):
+            with self.assertRaisesRegex(RuntimeError, 'Pod is active or pending'):
+                restore.cluster_writer_stopped(HOMELAB_SHA)
+
+    def test_remote_revision_and_incomplete_inventory_fail_closed(self):
+        def stale_main(*args):
+            if args[0] == 'kubectl':
+                return restore.retire.API_SERVER
+            return f'{SHA}\trefs/heads/main'
+
+        with patch.object(restore.retire, 'command', side_effect=stale_main):
+            with self.assertRaisesRegex(RuntimeError, 'Homelab main moved'):
+                restore.cluster_writer_stopped(HOMELAB_SHA)
+        with patch.object(restore.retire, 'json_command', return_value={'items': 'partial'}):
+            with self.assertRaisesRegex(RuntimeError, 'Cannot verify all'):
+                restore.items('jobs')
+
+    def test_private_key_is_fixed_ssm_source_and_version(self):
+        metadata = {'Parameters': [{'Name': restore.SSM_KEY, 'Type': 'SecureString',
+                                    'KeyId': 'alias/aws/ssm', 'Version': 2}]}
+        with patch.object(restore.retire, 'aws_account') as account, \
+                patch.object(restore.retire, 'json_command', return_value=metadata):
+            self.assertEqual(restore.private_key_version(), 2)
+        account.assert_called_once_with()
+        response = {'Parameter': {'Name': restore.SSM_KEY, 'Type': 'SecureString',
+                                  'Version': 2, 'Value': KEY}}
+        with patch.object(restore.retire, 'aws_account') as account, \
+                patch.object(restore.retire, 'json_command', return_value=response) as command:
+            self.assertEqual(restore.private_key(2), KEY)
+        account.assert_called_once_with()
+        self.assertEqual(command.call_args.args,
+                         ('aws', 'ssm', 'get-parameter', '--region', 'us-west-2',
+                          '--name', restore.SSM_KEY, '--with-decryption', '--output', 'json'))
+        with patch.object(restore.retire, 'aws_account'), \
+                patch.object(restore.retire, 'json_command', return_value=response):
+            with self.assertRaisesRegex(RuntimeError, 'does not match'):
+                restore.private_key(3)
+
+        with patch.object(restore.retire, 'aws_account',
+                          side_effect=RuntimeError('wrong AWS account')), \
+                patch.object(restore.retire, 'json_command') as aws:
+            with self.assertRaisesRegex(RuntimeError, 'wrong AWS account'):
+                restore.private_key(2)
+        aws.assert_not_called()
+
+    def test_eso_outage_does_not_block_restore_guard_with_valid_ssm_key(self):
+        with patch.object(restore.retire, 'reviewed_main'), \
+                patch.object(restore, 'private_key_version', return_value=2), \
+                patch.object(restore.retire, 'legacy_runs_drained'), \
+                patch.object(restore, 'cluster_writer_stopped'), \
+                patch.object(restore.retire, 'private_key_sources', return_value=False), \
+                patch.object(restore.retire, 'transferred_credentials',
+                             side_effect=RuntimeError('ESO unavailable')) as eso:
+            self.assertEqual(restore.guard(SHA, HOMELAB_SHA), 2)
+        eso.assert_not_called()
+
+    def test_restore_streams_key_to_only_actions_secret_and_receipt_omits_it(self):
+        output = io.StringIO()
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append((args, kwargs))
+            return subprocess.CompletedProcess(args, 0, '', '')
+
+        with patch.object(sys, 'argv', [str(SCRIPT), 'restore', '--expected-sha', SHA,
+                                        '--homelab-sha', HOMELAB_SHA]), \
+                patch.object(restore, 'guard', side_effect=[2, 2]), \
+                patch.object(restore, 'private_key', return_value=KEY), \
+                patch.object(restore.retire, 'private_key_sources', return_value=True), \
+                patch.object(restore.retire, 'reviewed_main'), \
+                patch.object(restore, 'cluster_writer_stopped'), \
+                patch.object(restore.subprocess, 'run', side_effect=run), \
+                contextlib.redirect_stdout(output):
+            restore.main()
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], ('gh', 'secret', 'set', 'RENOVATE_PRIVATE_KEY',
+                                       '--app', 'actions', '--repo',
+                                       'github.com/Stuhlmuller/renovate'))
+        self.assertEqual(calls[0][1]['input'], KEY)
+        self.assertTrue(calls[0][1]['capture_output'])
+        self.assertNotIn(KEY, output.getvalue())
+        receipt = json.loads(output.getvalue())
+        self.assertEqual((receipt['state'], receipt['actions_private_key_present']),
+                         ('restored', True))
+
+    def test_post_write_failure_deletes_key_and_verifies_absence(self):
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 0, '', '')
+
+        with patch.object(sys, 'argv', [str(SCRIPT), 'restore', '--expected-sha', SHA,
+                                        '--homelab-sha', HOMELAB_SHA]), \
+                patch.object(restore, 'guard', side_effect=[2, 2]), \
+                patch.object(restore, 'private_key', return_value=KEY), \
+                patch.object(restore.retire, 'private_key_sources',
+                             side_effect=[True, False]), \
+                patch.object(restore.retire, 'reviewed_main'), \
+                patch.object(restore, 'cluster_writer_stopped',
+                             side_effect=RuntimeError('main moved')), \
+                patch.object(restore.subprocess, 'run', side_effect=run):
+            with self.assertRaisesRegex(RuntimeError, 'repository secret removed'):
+                restore.main()
+
+        self.assertEqual(calls[0][:3], ('gh', 'secret', 'set'))
+        self.assertEqual(calls[1], ('gh', 'secret', 'delete', 'RENOVATE_PRIVATE_KEY',
+                                    '--app', 'actions', '--repo',
+                                    'github.com/Stuhlmuller/renovate'))
+
+    def test_ambiguous_set_failure_reports_unverified_key_if_delete_cannot_prove_absence(self):
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 1, KEY, KEY)
+
+        with patch.object(sys, 'argv', [str(SCRIPT), 'restore', '--expected-sha', SHA,
+                                        '--homelab-sha', HOMELAB_SHA]), \
+                patch.object(restore, 'guard', side_effect=[2, 2]), \
+                patch.object(restore, 'private_key', return_value=KEY), \
+                patch.object(restore.retire, 'private_key_sources', return_value=True), \
+                patch.object(restore.subprocess, 'run', side_effect=run):
+            with self.assertRaisesRegex(RuntimeError, 'historical re-runs may now write') as err:
+                restore.main()
+
+        self.assertNotIn(KEY, str(err.exception))
+        self.assertEqual([call[2] for call in calls], ['set', 'delete'])
+
+    def test_set_timeout_still_deletes_and_verifies_absence(self):
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append(args)
+            if args[2] == 'set':
+                raise subprocess.TimeoutExpired(args, 90)
+            return subprocess.CompletedProcess(args, 0, '', '')
+
+        with patch.object(sys, 'argv', [str(SCRIPT), 'restore', '--expected-sha', SHA,
+                                        '--homelab-sha', HOMELAB_SHA]), \
+                patch.object(restore, 'guard', side_effect=[2, 2]), \
+                patch.object(restore, 'private_key', return_value=KEY), \
+                patch.object(restore.retire, 'private_key_sources', return_value=False), \
+                patch.object(restore.subprocess, 'run', side_effect=run):
+            with self.assertRaisesRegex(RuntimeError, 'repository secret removed'):
+                restore.main()
+
+        self.assertEqual([call[2] for call in calls], ['set', 'delete'])
+
+
+if __name__ == '__main__':
+    unittest.main()
