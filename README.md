@@ -50,9 +50,13 @@ reads a secret value.
 
 For rollback, suspend the cluster CronJob through reviewed homelab GitOps, wait
 for Argo to sync that revision, and verify all Renovate Jobs and Pods are
-terminal before restoring the legacy workflow by reviewed PR. A reviewed,
-fixed-source secret reinjection path must restore the
-Actions private-key secret before the legacy workflow can write again. Future
-credential transfer or rotation likewise needs temporary reinjection of that
+terminal before restoring the legacy workflow by reviewed PR. Before restoring
+its Actions key, require a fresh credential-free GitHub-hosted probe of Harbor
+DNS, normal TLS, and registry endpoint reachability. A local or in-cluster
+probe does not prove the old runner's route; a 401 proves only reachability.
+If the hosted probe is unavailable or fails, keep the key absent and repair
+the cluster runner. A reviewed, fixed-source secret reinjection path must
+restore the Actions private-key secret before the legacy workflow can write again.
+Future credential transfer or rotation likewise needs temporary reinjection of that
 secret and the reviewed temporary AWS transfer role; retire both again after
 SSM and ExternalSecret verification.
