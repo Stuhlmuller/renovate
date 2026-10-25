@@ -48,14 +48,42 @@ numbers, timestamps, and the reviewed SHA. Do not enable cluster writes until
 that post-deletion receipt is recorded. The command is idempotent and never
 reads a secret value.
 
-## Restore the Actions key for rollback
+## Optional legacy fallback
 
-First merge a reviewed homelab GitOps change that suspends the `automation/renovate`
-CronJob. Wait for the Renovate Argo Application to sync to that exact homelab
-`main` revision and for all Renovate Jobs and Pods to finish. Keep the legacy
-Actions workflow absent from companion `main`. From a clean checkout of its
-exact reviewed `main` commit, use an operator identity with read access to the
-declared SSM SecureString and write access to this repository's Actions secrets:
+The normal rollback suspends the `automation/renovate` CronJob through reviewed
+homelab GitOps, verifies exact Argo sync and drained Jobs/Pods, then repairs or
+reverts the same cluster runner. Before its first proven write-enabled Job,
+return to full dry-run or suspension and record the no-writer gap. Keep the old
+Actions key absent.
+
+If legacy restoration is needed, first merge the reviewed manual
+`harbor-route-probe.yml` workflow into companion `main`. Run it on the
+GitHub-hosted `ubuntu-latest` runner after the current Harbor DNS/route change
+and before restoring the Actions key:
+
+```sh
+gh workflow run harbor-route-probe.yml --repo Stuhlmuller/renovate --ref main
+gh run list --repo Stuhlmuller/renovate --workflow harbor-route-probe.yml \
+  --limit 1 --json databaseId,headSha,status,conclusion,createdAt
+gh run view <probe-run-id> --repo Stuhlmuller/renovate --log
+```
+
+Record the exact completed run ID, head SHA, and time. Require
+`harbor_dns=ok`, `registry_http=200` or `401`, `manifest_http=200` or `401`,
+and `harbor_route=pass`. The probe uses direct HTTPS with normal certificate
+validation, `permissions: {}`, no checkout, no referenced secret, and no
+Renovate invocation. A `401` proves only the registry endpoint responded;
+private-package authentication and update parity remain unverified. If the
+route probe fails or DNS changes afterward, keep the Actions key absent and
+repair the cluster writer.
+
+Only after a fresh passing route probe, merge a reviewed homelab GitOps change
+that suspends the CronJob. Wait for the Renovate Argo Application to sync to
+that exact homelab `main` revision and for all Renovate Jobs and Pods to
+finish. Keep the legacy Actions workflow absent from companion `main`. From a
+clean checkout of its exact reviewed `main` commit, use an operator identity
+with read access to the declared SSM SecureString and write access to this
+repository's Actions secrets:
 
 ```sh
 python3 -I scripts/restore-renovate-actions-key.py check \
