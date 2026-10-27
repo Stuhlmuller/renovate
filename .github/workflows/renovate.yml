@@ -24,16 +24,26 @@ jobs:
           probe_config="$(mktemp -d \
             "${RUNNER_TEMP}/renovate-harbor-probe.XXXXXX")"
           trap 'rm -rf "$probe_config"' EXIT
+          probe_error="$probe_config/stderr"
           image="harbor.stinkyboi.com/mirror/docker.io/library/postgres"
           image+="@sha256:afc7e2d441324c0388fa80c3d24f733b"
           image+="4194a4eb7f47dd8ee2b08eb1a24a647c"
           if timeout --signal=TERM --kill-after=5s 45s \
             docker --config "$probe_config" manifest inspect "$image" \
-            >/dev/null 2>&1; then
+            >/dev/null 2>"$probe_error"; then
             echo "Harbor Docker route probe passed."
           else
             status=$?
-            echo "::error::Harbor probe exit ${status}; no App token."
+            # The empty Docker config has no credentials; still redact registry tokens.
+            detail="$(awk 'NR == 1 {
+              gsub(/https?:\/\/[^[:space:]\"]+/, "<url>")
+              gsub(/(Bearer|Basic) [^[:space:]]+/, "<credential>")
+              gsub(/(token|password|secret)=[^[:space:]]+/, "<redacted>")
+              gsub(/[[:cntrl:]]/, "")
+              print substr($0, 1, 400); exit
+            }' "$probe_error")"
+            echo "::error::Harbor probe exit ${status};" \
+              "${detail:-no Docker stderr}; no App token."
             exit "$status"
           fi
 
