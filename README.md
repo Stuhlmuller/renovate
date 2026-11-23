@@ -23,3 +23,18 @@ probe does not replace an error-free nine-repository Renovate run for parity.
 Update the probe digest if the homelab restore-drill image changes.
 Revert the workflow change through a reviewed PR if the probe itself needs to
 be removed.
+
+## Private Harbor probe
+
+Dispatch **Probe private Harbor for Renovate** from `main` after the dedicated
+registry relay and its Tailnet Lock identity have been provisioned and reviewed.
+The job uses the main-only `renovate-production` environment. Its network steps
+run only when that environment's `RENOVATE_HARBOR_ACCESS_READY` variable is
+`true`. Store the signed runner enrollment key as the environment secret
+`RENOVATE_TAILSCALE_AUTH_KEY`.
+
+The job checks anonymous access to a pinned mirrored manifest and verifies TLS,
+the canonical token challenge, and management endpoint denial from the
+digest-resolved Renovate container. The scheduled Renovate workflow continues
+to operate independently. Switching it to the private route is a separate
+change.

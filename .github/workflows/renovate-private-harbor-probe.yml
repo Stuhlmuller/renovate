@@ -1,0 +1,125 @@
+name: Probe private Harbor for Renovate
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: renovate-private-harbor-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    if: github.repository == 'Stuhlmuller/renovate' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: renovate-production
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check private access readiness
+        id: readiness
+        env:
+          ACCESS_READY: ${{ vars.RENOVATE_HARBOR_ACCESS_READY }}
+        run: |
+          set -euo pipefail
+          if [[ "$ACCESS_READY" != true ]]; then
+            echo "::notice::Private Harbor access is awaiting infrastructure verification."
+            exit 0
+          fi
+          echo "probe=true" >>"$GITHUB_OUTPUT"
+
+      - name: Checkout
+        if: steps.readiness.outputs.probe == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify exact current main
+        if: steps.readiness.outputs.probe == 'true'
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          current_main="$(git ls-remote https://github.com/Stuhlmuller/renovate.git refs/heads/main | cut -f1)"
+          test "$current_main" = "$GITHUB_SHA"
+
+      - name: Join registry-only tailnet route
+        id: join
+        if: steps.readiness.outputs.probe == 'true'
+        env:
+          RENOVATE_TAILSCALE_AUTH_KEY: ${{ secrets.RENOVATE_TAILSCALE_AUTH_KEY }}
+        run: bash scripts/renovate-private-harbor.sh join
+
+      - name: Probe anonymous Harbor Docker route
+        if: steps.readiness.outputs.probe == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          status="$(curl --proto '=https' --silent --show-error --max-time 15 \
+            --output /dev/null --write-out '%{http_code}' https://harbor.stinkyboi.com/api/v2.0/ping)"
+          if [[ "$status" != 404 ]]; then
+            echo "::error::Private Harbor endpoint did not reject the management API."
+            exit 1
+          fi
+          probe_config="$(mktemp -d \
+            "${RUNNER_TEMP}/renovate-harbor-probe.XXXXXX")"
+          trap 'rm -rf "$probe_config"' EXIT
+          probe_error="$probe_config/stderr"
+          image="harbor.stinkyboi.com/mirror/docker.io/library/postgres"
+          image+="@sha256:afc7e2d441324c0388fa80c3d24f733b"
+          image+="4194a4eb7f47dd8ee2b08eb1a24a647c"
+          if timeout --signal=TERM --kill-after=5s 45s \
+            docker --config "$probe_config" manifest inspect "$image" \
+            >/dev/null 2>"$probe_error"; then
+            echo "Harbor Docker route probe passed."
+          else
+            status=$?
+            # The empty Docker config has no credentials; still redact registry tokens.
+            detail="$(awk 'NR == 1 {
+              gsub(/https?:\/\/[^[:space:]\"]+/, "<url>")
+              gsub(/(Bearer|Basic) [^[:space:]]+/, "<credential>")
+              gsub(/(token|password|secret)=[^[:space:]]+/, "<redacted>")
+              gsub(/[[:cntrl:]]/, "")
+              print substr($0, 1, 400); exit
+            }' "$probe_error")"
+            echo "::error::Harbor probe exit ${status};" \
+              "${detail:-no Docker stderr}; no App token."
+            exit "$status"
+          fi
+
+      - name: Verify Renovate container registry transport
+        if: steps.readiness.outputs.probe == 'true'
+        run: |
+          set -euo pipefail
+          repository=ghcr.io/renovatebot/renovate
+          major=43
+          tag="$repository:$major"
+          if ! timeout --kill-after=5s 120s docker pull "$tag" >/dev/null 2>&1; then
+            echo "::error::Could not resolve the Renovate runtime image."
+            exit 1
+          fi
+          resolved="$(docker image inspect --format '{{json .RepoDigests}}' "$tag" |
+            jq -er --arg prefix "$repository@" '
+              map(select(startswith($prefix))) | unique | select(length == 1) | .[0]
+            ')"
+          digest="${resolved##*@}"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          version="$major@$digest"
+          if ! timeout --kill-after=5s 120s docker run --rm \
+            --volume /etc/hosts:/etc/hosts:ro --entrypoint node "$repository:$version" \
+            -e 'const root = "https://harbor.stinkyboi.com";
+                Promise.all(["/v2/", "/api/v2.0/ping"].map(path =>
+                  fetch(root + path, { redirect: "error", signal: AbortSignal.timeout(10000) })
+                )).then(([registry, management]) => {
+                  const challenge = registry.headers.get("www-authenticate") ?? "";
+                  if (registry.status !== 401 || management.status !== 404 ||
+                      !challenge.startsWith("Bearer ") ||
+                      !challenge.includes("realm=" + JSON.stringify(root + "/service/token"))) process.exitCode = 1;
+                }).catch(() => { process.exitCode = 1; });' >/dev/null 2>&1; then
+            echo "::error::Renovate's container could not verify the private Harbor registry route."
+            exit 1
+          fi
+
+      - name: Leave registry-only tailnet route
+        if: always() && (steps.join.outcome == 'success' || steps.join.outcome == 'failure' || steps.join.outcome == 'cancelled')
+        run: bash scripts/renovate-private-harbor.sh leave
